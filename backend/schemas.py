@@ -9,7 +9,7 @@ rather than numeric IDs — the API layer resolves them to DB IDs.
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
