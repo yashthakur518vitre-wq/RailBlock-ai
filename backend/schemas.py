@@ -298,7 +298,7 @@ class MaintenanceTaskCreate(BaseModel):
     estimated_duration_minutes: int = Field(..., gt=0,
                                             description="Estimated work duration (must be > 0)")
     asset_impact_score: float = Field(
-        default=0.0, ge=0.0,
+        default=0.0, ge=0.0, le=100.0,
         description="0–100 scale, domain expert assessment of asset impact if deferred"
     )
 
