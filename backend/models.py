@@ -1,13 +1,16 @@
 """
 models.py — SQLAlchemy ORM models for RailBlock AI (SIH26027).
 
-Stage 1 improvements:
+Hardened Stage:
   - Stronger defaults
   - Automatic timestamps
   - Database indexes for scheduling queries
   - Explicit foreign-key deletion behaviour
-  - Improved relationship configuration
-  - Clear domain constraints/documentation
+  - Domain validation constraints
+  - Explicit horizon/status/resource validation
+  - Corridor -> BlockPlan relationship
+  - Maintenance duration bounded to one operational day
+  - Clear domain documentation
 
 Entities:
   DepartmentModel
@@ -20,14 +23,20 @@ Entities:
   BlockPlanModel
 
 NOTE:
-  Time fields intentionally remain String ("HH:MM") in Stage 1 so the
-  existing schemas/services/optimizer remain compatible. Time migration
-  will be handled only after those files are reviewed.
+  Time fields intentionally remain String ("HH:MM") so the existing
+  API/schema/optimizer remain compatible.
+
+  IMPORTANT:
+  SQLAlchemy model constraints do NOT automatically modify an already
+  existing database table. If your database already exists, run the
+  appropriate migration or recreate the development database after
+  applying this file.
 """
 
 from datetime import datetime
 
 from sqlalchemy import (
+    CheckConstraint,
     Column,
     Integer,
     String,
@@ -45,11 +54,6 @@ from database import Base
 
 # ===========================================================================
 # Department
-# ===========================================================================
-# Represents:
-#   ENG  -> Engineering / TMS
-#   SNT  -> Signal & Telecom / SMMS
-#   TD   -> Traction Distribution / TDMS
 # ===========================================================================
 
 class DepartmentModel(Base):
@@ -120,9 +124,12 @@ class CorridorModel(Base):
         nullable=False,
     )
 
-    # Number of maintenance activities that can theoretically be handled
-    # per day. Detailed simultaneous-use constraints are handled by the
-    # optimizer.
+    # Number of maintenance activities that can theoretically run
+    # simultaneously on this corridor.
+    #
+    # NOTE:
+    # The optimizer interprets this value as simultaneous interval
+    # capacity, not "total number of activities during the whole day".
     line_capacity_per_day = Column(
         Integer,
         default=1,
@@ -154,15 +161,26 @@ class CorridorModel(Base):
         passive_deletes=True,
     )
 
+    block_plans = relationship(
+        "BlockPlanModel",
+        back_populates="corridor",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "line_capacity_per_day >= 1",
+            name="ck_corridor_capacity_positive",
+        ),
+        Index(
+            "ix_corridor_block_id",
+            "block_id",
+        ),
+    )
+
 
 # ===========================================================================
 # Maintenance Resource
-# ===========================================================================
-# Examples:
-#   Track machine
-#   Signal crew
-#   OHE crew
-#   Maintenance vehicle
 # ===========================================================================
 
 class ResourceModel(Base):
@@ -223,19 +241,23 @@ class ResourceModel(Base):
         passive_deletes=True,
     )
 
+    block_plans = relationship(
+        "BlockPlanModel",
+        back_populates="resource",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "availability_status IN "
+            "('available', 'unavailable', 'under_maintenance')",
+            name="ck_resource_availability_status",
+        ),
+    )
+
 
 # ===========================================================================
 # Availability Window
-# ===========================================================================
-# Represents a period during which a corridor is available for maintenance.
-#
-# Example:
-#   B001
-#   2026-08-27
-#   01:00 -> 04:00
-#
-# Time values intentionally remain strings in Stage 1 for compatibility with
-# the existing API/schema/optimizer.
 # ===========================================================================
 
 class AvailabilityWindowModel(Base):
@@ -269,7 +291,7 @@ class AvailabilityWindowModel(Base):
         nullable=False,
     )
 
-    # False means a goods-train forecast blocks this window.
+    # False means the goods forecast blocks this window.
     is_goods_forecast_clear = Column(
         Boolean,
         default=True,
@@ -288,6 +310,11 @@ class AvailabilityWindowModel(Base):
             "corridor_id",
             "date",
         ),
+        Index(
+            "ix_availability_date_clear",
+            "date",
+            "is_goods_forecast_clear",
+        ),
     )
 
 
@@ -300,7 +327,6 @@ class TrainModel(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # Example: 12001
     train_id = Column(
         String,
         unique=True,
@@ -313,9 +339,8 @@ class TrainModel(Base):
         nullable=False,
     )
 
-    # Priority:
-    #   1 = highest
-    #   5 = lowest
+    # 1 = highest
+    # 5 = lowest
     priority = Column(
         Integer,
         default=3,
@@ -329,17 +354,16 @@ class TrainModel(Base):
         passive_deletes=True,
     )
 
+    __table_args__ = (
+        CheckConstraint(
+            "priority >= 1 AND priority <= 5",
+            name="ck_train_priority_range",
+        ),
+    )
+
 
 # ===========================================================================
 # Train Occupancy
-# ===========================================================================
-# Represents the period during which a train occupies a corridor.
-#
-# source:
-#   timetable
-#   goods_forecast
-#
-# Maintenance must not overlap with an occupancy period.
 # ===========================================================================
 
 class TrainOccupancyModel(Base):
@@ -372,8 +396,6 @@ class TrainOccupancyModel(Base):
         index=True,
         nullable=False,
     )
-
-    
 
     entry_time = Column(
         String,
@@ -419,26 +441,6 @@ class TrainOccupancyModel(Base):
 
 # ===========================================================================
 # Maintenance Task
-# ===========================================================================
-# Unified representation of:
-#   TMS  -> Engineering
-#   SMMS -> Signal & Telecom
-#   TDMS -> Traction Distribution
-#
-# Criticality:
-#   1 = highest safety risk
-#   5 = lowest safety risk
-#
-# Status lifecycle:
-#   pending
-#      ↓
-#   scheduled
-#      ↓
-#   completed
-#
-# Alternative:
-#   pending -> deferred
-#   pending -> cancelled
 # ===========================================================================
 
 class MaintenanceTaskModel(Base):
@@ -519,6 +521,13 @@ class MaintenanceTaskModel(Base):
         index=True,
     )
 
+    # Maximum 24 hours.
+    #
+    # This allows overnight work such as:
+    # 23:00 -> 01:00
+    #
+    # but prevents a single task from becoming an unbounded multi-day
+    # interval, which would require a different operational model.
     estimated_duration_minutes = Column(
         Integer,
         nullable=False,
@@ -539,7 +548,6 @@ class MaintenanceTaskModel(Base):
         index=True,
     )
 
-    # Useful for auditability and dashboard reporting.
     created_at = Column(
         DateTime,
         default=datetime.utcnow,
@@ -576,6 +584,25 @@ class MaintenanceTaskModel(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "criticality >= 1 AND criticality <= 5",
+            name="ck_task_criticality_range",
+        ),
+        CheckConstraint(
+            "estimated_duration_minutes > 0 "
+            "AND estimated_duration_minutes <= 1440",
+            name="ck_task_duration_range",
+        ),
+        CheckConstraint(
+            "asset_impact_score >= 0 "
+            "AND asset_impact_score <= 100",
+            name="ck_task_asset_impact_range",
+        ),
+        CheckConstraint(
+            "status IN "
+            "('pending', 'scheduled', 'completed', 'deferred', 'cancelled')",
+            name="ck_task_status",
+        ),
         Index(
             "ix_maintenance_status_due_date",
             "status",
@@ -586,19 +613,16 @@ class MaintenanceTaskModel(Base):
             "corridor_id",
             "status",
         ),
+        Index(
+            "ix_maintenance_corridor_due",
+            "corridor_id",
+            "due_date",
+        ),
     )
 
 
 # ===========================================================================
 # Block Plan
-# ===========================================================================
-# Output of the CP-SAT optimizer.
-#
-# One row represents one maintenance task scheduled inside a corridor
-# availability window.
-#
-# Tasks sharing block_group_id can represent coordinated/parallel
-# cross-department work in the same physical block.
 # ===========================================================================
 
 class BlockPlanModel(Base):
@@ -606,7 +630,7 @@ class BlockPlanModel(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # A maintenance task should have at most one active generated plan.
+    # One active generated plan per maintenance task.
     task_id = Column(
         Integer,
         ForeignKey(
@@ -699,6 +723,7 @@ class BlockPlanModel(Base):
 
     corridor = relationship(
         "CorridorModel",
+        back_populates="block_plans",
     )
 
     availability_window = relationship(
@@ -707,9 +732,14 @@ class BlockPlanModel(Base):
 
     resource = relationship(
         "ResourceModel",
+        back_populates="block_plans",
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "horizon IN ('weekly', 'monthly')",
+            name="ck_block_plan_horizon",
+        ),
         Index(
             "ix_block_plan_date_corridor",
             "scheduled_date",
@@ -719,5 +749,12 @@ class BlockPlanModel(Base):
             "ix_block_plan_horizon_date",
             "horizon",
             "scheduled_date",
+        ),
+        Index(
+            "ix_block_plan_corridor_date_time",
+            "corridor_id",
+            "scheduled_date",
+            "entry_time",
+            "exit_time",
         ),
     )
