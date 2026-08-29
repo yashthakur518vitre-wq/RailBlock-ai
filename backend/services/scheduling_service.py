@@ -23,6 +23,9 @@ Important:
 
 from __future__ import annotations
 
+import os
+import sys
+import time
 from datetime import date, datetime, timedelta
 
 from fastapi import HTTPException
@@ -31,6 +34,23 @@ from sqlalchemy.orm import Session
 import models
 from optimizer.cp_sat_optimizer import run_cp_sat_block_planning
 from services.priority_service import compute_priority_score
+
+
+# ===========================================================================
+# DEBUG LOGGING
+# ===========================================================================
+#
+# Controlled by the RAILBLOCK_DEBUG environment variable (default: on).
+# Set RAILBLOCK_DEBUG=0 to silence these once the endpoint is confirmed
+# to be working reliably.
+# ===========================================================================
+
+_DEBUG_ENABLED = os.getenv("RAILBLOCK_DEBUG", "1") != "0"
+
+
+def _log(message: str) -> None:
+    if _DEBUG_ENABLED:
+        print(f"[GENERATE] {message}", flush=True, file=sys.stderr)
 
 
 # ===========================================================================
@@ -168,11 +188,37 @@ def _validate_scheduled_entry(
             ),
         ) from exc
 
+    window_is_overnight = window_end <= window_start
+
+    if window_is_overnight:
+        window_end += 1440
+
     if entry_end <= entry_start:
         entry_end += 1440
 
-    if window_end <= window_start:
-        window_end += 1440
+    # ------------------------------------------------------------------
+    # Overnight-window fix:
+    #
+    # An overnight window (e.g. 23:00 -> 04:00) is stored as a single
+    # local-time range that wraps past midnight. A task can be placed
+    # either in the "evening" portion (entry_start >= window_start,
+    # e.g. 23:00-23:30) or in the "after-midnight" portion (e.g.
+    # 03:00-04:00). The optimizer always reports entry/exit as plain
+    # local wall-clock strings and keeps scheduled_date pinned to the
+    # window's start date (matching the convention already used for
+    # train occupancy).
+    #
+    # Because "03:00-04:00" does not itself cross midnight, the old
+    # code compared it directly against the window's wrapped range
+    # (1380 -> 1680) and incorrectly rejected it (180 < 1380). If the
+    # window is overnight and the entry's start time is earlier than
+    # the window's local start time, the entry must belong to the
+    # after-midnight portion of the SAME window occurrence, so it is
+    # shifted onto the same absolute timeline before comparing.
+    # ------------------------------------------------------------------
+    if window_is_overnight and entry_start < window_start:
+        entry_start += 1440
+        entry_end += 1440
 
     if entry_start < window_start or entry_end > window_end:
         raise HTTPException(
@@ -207,6 +253,9 @@ def generate_block_plan(
 ) -> dict:
     """Generate, persist, and return a railway maintenance block plan."""
 
+    _request_start = time.time()
+    _log(f"Starting (horizon={horizon!r}, regenerate={regenerate!r})")
+
     # ------------------------------------------------------------------
     # Validate horizon
     # ------------------------------------------------------------------
@@ -238,6 +287,8 @@ def generate_block_plan(
         .count()
     )
 
+    _log(f"Existing block plan rows for horizon={horizon!r}: {existing_count}")
+
     if existing_count > 0:
 
         if not regenerate:
@@ -267,7 +318,11 @@ def generate_block_plan(
         .all()
     )
 
+    _log(f"Loaded pending tasks: {len(pending_tasks_orm)}")
+
     if not pending_tasks_orm:
+
+        _log("No pending tasks - returning empty response.")
 
         try:
             db.commit()
@@ -296,13 +351,30 @@ def generate_block_plan(
 
     tasks_input: list[dict] = []
 
-    for task in pending_tasks_orm:
+    _log(
+        "Computing priority scores for "
+        f"{len(pending_tasks_orm)} task(s) "
+        "(entering services.priority_service.compute_priority_score)..."
+    )
+
+    for _task_seq, task in enumerate(pending_tasks_orm, start=1):
+
+        _log(
+            f"  priority_score[{_task_seq}/{len(pending_tasks_orm)}] "
+            f"task_id={task.id} task_ref={task.task_ref!r} - calling "
+            "compute_priority_score()"
+        )
 
         score = compute_priority_score(
             criticality=task.criticality,
             due_date=task.due_date,
             asset_impact_score=task.asset_impact_score,
             as_of=today,
+        )
+
+        _log(
+            f"  priority_score[{_task_seq}/{len(pending_tasks_orm)}] "
+            f"task_id={task.id} -> score={score}"
         )
 
         tasks_input.append(
@@ -330,6 +402,8 @@ def generate_block_plan(
         reverse=True,
     )
 
+    _log(f"Priority scoring complete. tasks_input={len(tasks_input)}")
+
     # ------------------------------------------------------------------
     # Availability windows
     # ------------------------------------------------------------------
@@ -346,6 +420,11 @@ def generate_block_plan(
             models.AvailabilityWindowModel.start_time,
         )
         .all()
+    )
+
+    _log(
+        f"Loaded availability windows: {len(windows_orm)} "
+        f"(range {today} .. {horizon_end})"
     )
 
     windows_input: list[dict] = []
@@ -416,6 +495,8 @@ def generate_block_plan(
         )
         .all()
     )
+
+    _log(f"Loaded train occupancies: {len(occupancies_orm)}")
 
     occupancies_input = [
         {
@@ -522,6 +603,13 @@ def generate_block_plan(
     # Run CP-SAT
     # ------------------------------------------------------------------
 
+    _log(
+        "Loaded resources="
+        f"{len(resources_input)}, corridors={len(corridor_capacities)}, "
+        f"occupancy_records={len(occupancies_input)}. "
+        "Calling optimizer.cp_sat_optimizer.run_cp_sat_block_planning()..."
+    )
+
     try:
 
         result = run_cp_sat_block_planning(
@@ -536,12 +624,21 @@ def generate_block_plan(
         )
 
     except HTTPException:
+        _log("Optimizer raised HTTPException - rolling back.")
         db.rollback()
         raise
 
-    except Exception:
+    except Exception as exc:
+        _log(f"Optimizer raised unexpected exception: {exc!r} - rolling back.")
         db.rollback()
         raise
+
+    _log(
+        "Optimizer returned. "
+        f"scheduled={len(result.get('scheduled', []))}, "
+        f"unscheduled={len(result.get('unscheduled', []))}, "
+        f"solver_status={result.get('optimization_summary', {}).get('solver_status')}"
+    )
 
     # ------------------------------------------------------------------
     # Defensive result validation
@@ -564,6 +661,8 @@ def generate_block_plan(
             task_by_id=task_orm_by_id,
             window_by_id=window_orm_by_id,
         )
+
+    _log("Defensive validation of scheduled entries passed. Saving result...")
 
     # ------------------------------------------------------------------
     # Persist scheduled entries
@@ -644,6 +743,13 @@ def generate_block_plan(
     # ------------------------------------------------------------------
 
     summary = result["optimization_summary"]
+
+    _log(
+        f"Completed in {(time.time() - _request_start) * 1000:.1f} ms "
+        f"(solver_status={summary.get('solver_status')}, "
+        f"scheduled={len(result['scheduled'])}, "
+        f"unscheduled={len(result['unscheduled'])})"
+    )
 
     return {
         "horizon": horizon,

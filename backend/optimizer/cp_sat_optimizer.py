@@ -3,7 +3,7 @@ optimizer/cp_sat_optimizer.py
 
 RailBlock AI — Railway Maintenance Block Optimizer
 
-Fast and hardened CP-SAT implementation for SIH26027.
+CP-SAT based optimizer for SIH26027.
 
 Design goals:
 - Keep the CP-SAT model small and deterministic.
@@ -39,15 +39,7 @@ from ortools.sat.python import cp_model
 # CONFIGURATION
 # ============================================================================
 
-# IMPORTANT:
-# Keep this short for the Stage-3 demo.
-#
-# The previous implementation could spend a very long time constructing
-# or solving a large model. Ten seconds is more than enough for the current
-# hackathon-scale dataset.
 SOLVER_TIME_LIMIT_SECONDS = 10.0
-
-# One worker gives deterministic behaviour and avoids unnecessary CPU usage.
 SOLVER_WORKERS = 1
 
 MINUTES_PER_DAY = 24 * 60
@@ -61,9 +53,7 @@ WEIGHT_PRIORITY = 1000
 WEIGHT_CRITICALITY = 500
 WEIGHT_ASSET_IMPACT = 300
 WEIGHT_OVERDUE = 250
-WEIGHT_COORDINATION = 150
 
-PENALTY_BLOCK_COUNT = 120
 PENALTY_BLOCK_MINUTE = 2
 PENALTY_FREIGHT_IMPACT = 250
 PENALTY_LATE_DAY = 20
@@ -74,18 +64,12 @@ PENALTY_LATE_DAY = 20
 # ============================================================================
 
 def _to_minutes(value: Any) -> int:
-    """
-    Convert HH:MM into minutes from midnight.
-
-    Example:
-        "02:30" -> 150
-    """
+    """Convert HH:MM into minutes from midnight."""
 
     if value is None:
         raise ValueError("Time cannot be empty.")
 
     text = str(value).strip()
-
     parts = text.split(":")
 
     if len(parts) != 2:
@@ -115,12 +99,7 @@ def _to_minutes(value: Any) -> int:
 
 
 def _from_minutes(total_minutes: int) -> str:
-    """
-    Convert an absolute planning minute to HH:MM.
-
-    The modulo operation is intentional because a maintenance
-    activity may cross midnight.
-    """
+    """Convert absolute planning minutes to HH:MM."""
 
     total_minutes %= MINUTES_PER_DAY
 
@@ -131,27 +110,20 @@ def _from_minutes(total_minutes: int) -> str:
 
 
 def _parse_date(value: Any) -> date | None:
-    """
-    Convert supported date representations into datetime.date.
-    """
+    """Convert supported date representations into date."""
 
     if value is None:
         return None
 
-    if isinstance(value, date):
-        return value
-
     if isinstance(value, datetime):
         return value.date()
 
+    if isinstance(value, date):
+        return value
+
     try:
-        return date.fromisoformat(
-            str(value)
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
         return None
 
 
@@ -160,14 +132,12 @@ def _normalize_interval(
     end: int,
 ) -> tuple[int, int]:
     """
-    Convert a local interval into a forward interval.
+    Convert local interval into a forward interval.
 
     Example:
-
         23:00 -> 04:00
 
     becomes:
-
         1380 -> 1680
     """
 
@@ -183,11 +153,7 @@ def _overlaps(
     start_b: int,
     end_b: int,
 ) -> bool:
-    """
-    Half-open interval overlap test.
-
-    10:00-11:00 and 11:00-12:00 do NOT overlap.
-    """
+    """Half-open interval overlap test."""
 
     return (
         start_a < end_b
@@ -201,10 +167,22 @@ def _duration(
 ) -> int:
     """Return non-negative duration."""
 
-    return max(
-        0,
-        end - start,
-    )
+    return max(0, end - start)
+
+
+def _json_safe_date(value: Any) -> str | None:
+    """
+    Convert a date/datetime (or ISO string) into a plain ISO string
+    for JSON serialization. Returns None for missing/invalid values.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+
+    return str(value)
 
 
 # ============================================================================
@@ -215,11 +193,9 @@ def _date_offset(
     value: date,
     base_date: date,
 ) -> int:
-    """Return day offset from the planning start date."""
+    """Return day offset from planning start date."""
 
-    return (
-        value - base_date
-    ).days
+    return (value - base_date).days
 
 
 def _global_interval(
@@ -229,17 +205,7 @@ def _global_interval(
     base_date: date,
 ) -> tuple[int, int]:
     """
-    Convert a local date/time interval into the global planning timeline.
-
-    Example:
-
-        base_date = 2026-08-28
-
-        2026-08-28 23:00 -> 2026-08-29 01:00
-
-        becomes:
-
-        1380 -> 1500
+    Convert local date/time interval into global planning minutes.
     """
 
     day_offset = _date_offset(
@@ -260,10 +226,7 @@ def _global_interval(
     if global_end <= global_start:
         global_end += MINUTES_PER_DAY
 
-    return (
-        global_start,
-        global_end,
-    )
+    return global_start, global_end
 
 
 # ============================================================================
@@ -280,19 +243,9 @@ def _normalize_occupancy(
         corridor_id,
         global_start,
         global_end
-
-    Overnight occupancy is supported.
-
-    Example:
-
-        23:30 -> 01:30
-
-    becomes a two-hour interval crossing midnight.
     """
 
-    corridor_id = occupancy.get(
-        "corridor_id"
-    )
+    corridor_id = occupancy.get("corridor_id")
 
     occupancy_date = _parse_date(
         occupancy.get("date")
@@ -312,6 +265,9 @@ def _normalize_occupancy(
         end_local = _to_minutes(
             occupancy["exit_time"]
         )
+
+        corridor_id = int(corridor_id)
+
     except (
         KeyError,
         TypeError,
@@ -319,31 +275,17 @@ def _normalize_occupancy(
     ):
         return None
 
-    start_local, end_local = (
-        _normalize_interval(
-            start_local,
-            end_local,
-        )
+    start_local, end_local = _normalize_interval(
+        start_local,
+        end_local,
     )
 
-    global_start, global_end = (
-        _global_interval(
-            scheduled_date=occupancy_date,
-            local_start=start_local,
-            local_end=end_local,
-            base_date=base_date,
-        )
+    global_start, global_end = _global_interval(
+        scheduled_date=occupancy_date,
+        local_start=start_local,
+        local_end=end_local,
+        base_date=base_date,
     )
-
-    try:
-        corridor_id = int(
-            corridor_id
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
-        return None
 
     return (
         corridor_id,
@@ -355,14 +297,11 @@ def _normalize_occupancy(
 def _build_occupancy_lookup(
     train_occupancies: list[dict],
     base_date: date,
-) -> dict[
-    int,
-    list[tuple[int, int]]
-]:
+) -> dict[int, list[tuple[int, int]]]:
     """
     Build:
 
-        corridor_id -> list of absolute occupancy intervals
+        corridor_id -> occupancy intervals
     """
 
     lookup: dict[
@@ -370,32 +309,23 @@ def _build_occupancy_lookup(
         list[tuple[int, int]]
     ] = defaultdict(list)
 
-    for occupancy in (
-        train_occupancies or []
-    ):
+    for occupancy in train_occupancies or []:
 
         normalized = _normalize_occupancy(
-            occupancy=occupancy,
-            base_date=base_date,
+            occupancy,
+            base_date,
         )
 
         if normalized is None:
             continue
 
-        corridor_id, start, end = (
-            normalized
-        )
+        corridor_id, start, end = normalized
 
         if end <= start:
             continue
 
-        lookup[
-            corridor_id
-        ].append(
-            (
-                start,
-                end,
-            )
+        lookup[corridor_id].append(
+            (start, end)
         )
 
     for corridor_id in lookup:
@@ -411,28 +341,18 @@ def _build_occupancy_lookup(
 def _compute_free_intervals(
     window_start: int,
     window_end: int,
-    occupancy_ranges: list[
-        tuple[int, int]
-    ],
-) -> list[
-    tuple[int, int]
-]:
+    occupancy_ranges: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
     """
-    Remove train occupancy from a maintenance window.
-
-    Input and output are on the global planning timeline.
+    Remove train occupancy from maintenance window.
     """
 
     if window_end <= window_start:
         return []
 
-    relevant: list[
-        tuple[int, int]
-    ] = []
+    relevant = []
 
-    for occupancy_start, occupancy_end in (
-        occupancy_ranges
-    ):
+    for occupancy_start, occupancy_end in occupancy_ranges:
 
         if occupancy_end <= occupancy_start:
             continue
@@ -465,13 +385,9 @@ def _compute_free_intervals(
 
     relevant.sort()
 
-    merged: list[
-        tuple[int, int]
-    ] = []
+    merged = []
 
-    current_start, current_end = (
-        relevant[0]
-    )
+    current_start, current_end = relevant[0]
 
     for start, end in relevant[1:]:
 
@@ -501,18 +417,13 @@ def _compute_free_intervals(
         )
     )
 
-    free: list[
-        tuple[int, int]
-    ] = []
+    free = []
 
     cursor = window_start
 
-    for blocked_start, blocked_end in (
-        merged
-    ):
+    for blocked_start, blocked_end in merged:
 
         if cursor < blocked_start:
-
             free.append(
                 (
                     cursor,
@@ -526,7 +437,6 @@ def _compute_free_intervals(
         )
 
     if cursor < window_end:
-
         free.append(
             (
                 cursor,
@@ -542,33 +452,18 @@ def _compute_free_intervals(
 # ============================================================================
 
 def _find_fitting_starts(
-    free_intervals: list[
-        tuple[int, int]
-    ],
+    free_intervals: list[tuple[int, int]],
     duration_minutes: int,
 ) -> list[int]:
     """
-    Generate a VERY SMALL candidate set.
+    Generate a small candidate set.
 
-    We deliberately do NOT generate every five minutes.
+    For every free interval:
 
-    For each free interval we only use:
+        1. earliest possible start
+        2. latest possible start
 
-        1. the earliest possible start;
-        2. the latest possible start.
-
-    This dramatically reduces the CP-SAT model size.
-
-    Example:
-
-        free = 01:00 -> 04:00
-        task = 60 minutes
-
-        candidates:
-            01:00
-            03:00
-
-    CP-SAT then chooses between the meaningful alternatives.
+    This keeps the CP-SAT model small.
     """
 
     if duration_minutes <= 0:
@@ -582,22 +477,12 @@ def _find_fitting_starts(
             continue
 
         earliest = start
+        latest = end - duration_minutes
 
-        latest = (
-            end - duration_minutes
-        )
+        starts.add(earliest)
+        starts.add(latest)
 
-        starts.add(
-            earliest
-        )
-
-        starts.add(
-            latest
-        )
-
-    return sorted(
-        starts
-    )
+    return sorted(starts)
 
 
 # ============================================================================
@@ -608,14 +493,23 @@ def _safe_float(
     value: Any,
     default: float = 0.0,
 ) -> float:
-    """Safely convert a value into float."""
+    """Safely convert value to float."""
 
     try:
         return float(value)
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(
+    value: Any,
+    default: int = 0,
+) -> int:
+    """Safely convert value to int."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return default
 
 
@@ -623,28 +517,17 @@ def _criticality_score(
     value: Any,
 ) -> int:
     """
-    Convert domain criticality into optimization score.
-
     Domain:
 
         1 = most critical
         5 = least critical
     """
 
-    try:
-        criticality = int(value)
-    except (
-        TypeError,
-        ValueError,
-    ):
-        criticality = 5
+    criticality = _safe_int(value, 5)
 
     criticality = max(
         1,
-        min(
-            5,
-            criticality,
-        ),
+        min(5, criticality),
     )
 
     return 6 - criticality
@@ -656,32 +539,21 @@ def _overdue_days(
 ) -> int:
     """Return positive overdue days."""
 
-    parsed_due_date = _parse_date(
-        due_date
-    )
+    parsed_due_date = _parse_date(due_date)
 
     if parsed_due_date is None:
         return 0
 
     return max(
         0,
-        (
-            today - parsed_due_date
-        ).days,
+        (today - parsed_due_date).days,
     )
 
 
 def _freight_penalty(
     window: dict,
 ) -> int:
-    """
-    Calculate freight-impact penalty.
-
-    Normally scheduling_service.py already filters windows where
-    goods forecast is not clear.
-
-    This function is retained for direct optimizer use.
-    """
+    """Calculate freight impact penalty."""
 
     expected_goods = _safe_float(
         window.get(
@@ -698,11 +570,9 @@ def _freight_penalty(
     )
 
     has_forecast_fields = (
-        "expected_goods_trains"
-        in window
+        "expected_goods_trains" in window
         or
-        "freight_probability"
-        in window
+        "freight_probability" in window
     )
 
     if has_forecast_fields:
@@ -724,6 +594,45 @@ def _freight_penalty(
 
 
 # ============================================================================
+# CORRIDOR NORMALIZATION
+# ============================================================================
+
+def _get_task_corridor_id(
+    task: dict,
+    window: dict | None = None,
+) -> int | None:
+    """
+    Get normalized corridor ID from task.
+
+    Falls back to the window corridor.
+    """
+
+    corridor_id = task.get("corridor_id")
+
+    if corridor_id is not None:
+
+        try:
+            return int(corridor_id)
+        except (TypeError, ValueError):
+            pass
+
+    if window is not None:
+
+        corridor_id = window.get(
+            "corridor_id"
+        )
+
+        if corridor_id is not None:
+
+            try:
+                return int(corridor_id)
+            except (TypeError, ValueError):
+                pass
+
+    return None
+
+
+# ============================================================================
 # EMPTY RESULT
 # ============================================================================
 
@@ -732,9 +641,6 @@ def _empty_result(
     tasks: list[dict],
     solve_start: float,
 ) -> dict:
-    """
-    Return a safe result without invoking CP-SAT.
-    """
 
     task_list = tasks or []
 
@@ -742,12 +648,8 @@ def _empty_result(
         "scheduled": [],
         "unscheduled": [
             {
-                "task_id": task.get(
-                    "id"
-                ),
-                "task_ref": task.get(
-                    "task_ref"
-                ),
+                "task_id": task.get("id"),
+                "task_ref": task.get("task_ref"),
                 "department_code": task.get(
                     "department_code"
                 ),
@@ -760,8 +662,8 @@ def _empty_result(
                 "criticality": task.get(
                     "criticality"
                 ),
-                "due_date": task.get(
-                    "due_date"
+                "due_date": _json_safe_date(
+                    task.get("due_date")
                 ),
                 "priority_score": task.get(
                     "priority_score",
@@ -776,9 +678,7 @@ def _empty_result(
             "solver_optimal": False,
             "solver_feasible": False,
             "total_scheduled": 0,
-            "total_unscheduled": len(
-                task_list
-            ),
+            "total_unscheduled": len(task_list),
             "total_blocks": 0,
             "total_block_minutes": 0,
             "asset_availability_score": 100.0,
@@ -787,15 +687,10 @@ def _empty_result(
             "overdue_tasks_scheduled": 0,
             "average_scheduled_priority": 0.0,
             "solve_time_ms": round(
-                (
-                    time.time()
-                    - solve_start
-                ) * 1000,
+                (time.time() - solve_start) * 1000,
                 2,
             ),
-            "objective": (
-                "no optimization performed"
-            ),
+            "objective": "no optimization performed",
         },
     }
 
@@ -809,44 +704,20 @@ def _diagnose_unscheduled_reason(
     task: dict,
     tasks: list[dict],
     window_meta: list[dict],
-    candidates: dict[
-        tuple[int, int, int],
-        dict,
-    ],
-    selected_candidates: list[
-        tuple[int, int, int]
-    ],
-    normalized_incompatible: set[
-        frozenset[str]
-    ],
-    resource_available: dict[
-        Any,
-        bool,
-    ],
-    corridor_capacities: dict[
-        int,
-        int,
-    ],
+    candidates: dict[tuple[int, int, int], dict],
+    selected_candidates: list[tuple[int, int, int]],
+    normalized_incompatible: set[frozenset[str]],
+    resource_available: dict[Any, bool],
+    corridor_capacities: dict[int, int],
     today: date,
 ) -> str:
-    """
-    Give a best-effort explanation for an unscheduled task.
 
-    This is a diagnosis, not a mathematical proof.
-    """
-
-    try:
-        duration = int(
-            task.get(
-                "estimated_duration_minutes",
-                0,
-            )
+    duration = _safe_int(
+        task.get(
+            "estimated_duration_minutes",
+            0,
         )
-    except (
-        TypeError,
-        ValueError,
-    ):
-        duration = 0
+    )
 
     if duration <= 0:
         return "invalid_duration"
@@ -881,20 +752,22 @@ def _diagnose_unscheduled_reason(
         for key in selected_candidates
     }
 
+    task_corridor = _get_task_corridor_id(
+        task
+    )
+
     task_defect = str(
         task.get(
             "defect_type",
             "",
         )
-    ).upper()
+    ).upper().strip()
 
     capacity_seen = False
 
     for candidate_key in task_candidates:
 
-        candidate = candidates[
-            candidate_key
-        ]
+        candidate = candidates[candidate_key]
 
         task_start = candidate[
             "global_start"
@@ -905,32 +778,26 @@ def _diagnose_unscheduled_reason(
         ]
 
         window = window_meta[
-            candidate[
-                "window_index"
-            ]
+            candidate["window_index"]
         ]
 
-        corridor_id = window[
-            "corridor_id"
-        ]
+        corridor_id = _get_task_corridor_id(
+            task,
+            window,
+        )
 
         # ---------------------------------------------------------------
-        # Resource / safety conflict diagnosis
+        # Check selected conflicts
         # ---------------------------------------------------------------
 
         for selected_key in selected_candidates:
 
-            other_index = selected_key[
-                0
-            ]
+            other_index = selected_key[0]
 
             if other_index == task_index:
                 continue
 
-            if (
-                other_index
-                not in selected_task_indexes
-            ):
+            if other_index not in selected_task_indexes:
                 continue
 
             other_candidate = candidates[
@@ -941,36 +808,33 @@ def _diagnose_unscheduled_reason(
                 other_index
             ]
 
-            if (
-                other_task.get(
-                    "corridor_id"
-                )
-                != corridor_id
-            ):
+            other_window = window_meta[
+                other_candidate["window_index"]
+            ]
+
+            other_corridor = _get_task_corridor_id(
+                other_task,
+                other_window,
+            )
+
+            if corridor_id != other_corridor:
                 continue
 
             if not _overlaps(
                 task_start,
                 task_end,
-                other_candidate[
-                    "global_start"
-                ],
-                other_candidate[
-                    "global_end"
-                ],
+                other_candidate["global_start"],
+                other_candidate["global_end"],
             ):
                 continue
 
-            other_resource_id = (
-                other_task.get(
-                    "required_resource_id"
-                )
+            other_resource_id = other_task.get(
+                "required_resource_id"
             )
 
             if (
                 resource_id is not None
-                and resource_id
-                == other_resource_id
+                and resource_id == other_resource_id
             ):
                 return "resource_conflict"
 
@@ -979,7 +843,7 @@ def _diagnose_unscheduled_reason(
                     "defect_type",
                     "",
                 )
-            ).upper()
+            ).upper().strip()
 
             if (
                 frozenset(
@@ -990,21 +854,20 @@ def _diagnose_unscheduled_reason(
                 )
                 in normalized_incompatible
             ):
-                return (
-                    "safety_incompatibility"
-                )
+                return "safety_incompatibility"
 
         # ---------------------------------------------------------------
-        # Corridor capacity diagnosis
+        # Corridor capacity
         # ---------------------------------------------------------------
 
         capacity = max(
             1,
-            int(
+            _safe_int(
                 corridor_capacities.get(
                     corridor_id,
                     1,
-                )
+                ),
+                1,
             ),
         )
 
@@ -1016,12 +879,18 @@ def _diagnose_unscheduled_reason(
                 selected_key[0]
             ]
 
-            if (
-                selected_task.get(
-                    "corridor_id"
-                )
-                != corridor_id
-            ):
+            selected_window = window_meta[
+                candidates[selected_key][
+                    "window_index"
+                ]
+            ]
+
+            selected_corridor = _get_task_corridor_id(
+                selected_task,
+                selected_window,
+            )
+
+            if selected_corridor != corridor_id:
                 continue
 
             selected_candidate = candidates[
@@ -1031,12 +900,8 @@ def _diagnose_unscheduled_reason(
             if _overlaps(
                 task_start,
                 task_end,
-                selected_candidate[
-                    "global_start"
-                ],
-                selected_candidate[
-                    "global_end"
-                ],
+                selected_candidate["global_start"],
+                selected_candidate["global_end"],
             ):
                 simultaneous += 1
 
@@ -1044,26 +909,15 @@ def _diagnose_unscheduled_reason(
             capacity_seen = True
 
     if capacity_seen:
-        return (
-            "corridor_capacity_exhausted"
-        )
+        return "corridor_capacity_exhausted"
 
-    if (
-        _overdue_days(
-            task.get(
-                "due_date"
-            ),
-            today,
-        )
-        > 0
-    ):
-        return (
-            "optimizer_tradeoff_overdue_task"
-        )
+    if _overdue_days(
+        task.get("due_date"),
+        today,
+    ) > 0:
+        return "optimizer_tradeoff_overdue_task"
 
-    return (
-        "optimizer_tradeoff_lower_priority"
-    )
+    return "optimizer_tradeoff_lower_priority"
 
 
 # ============================================================================
@@ -1074,44 +928,36 @@ def run_cp_sat_block_planning(
     tasks: list[dict],
     windows: list[dict],
     train_occupancies: list[dict],
-    incompatible_pairs: set[
-        tuple[str, str]
-    ],
+    incompatible_pairs: set[tuple[str, str]],
     resources: list[dict],
-    corridor_capacities: dict[
-        int,
-        int,
-    ],
+    corridor_capacities: dict[int, int],
     today: date,
     horizon_str: str,
 ) -> dict:
     """
-    Run the RailBlock AI CP-SAT optimization.
-
-    This signature intentionally matches scheduling_service.py.
+    Run RailBlock AI CP-SAT optimization.
     """
 
     solve_start = time.time()
 
+    print(
+        "[OPTIMIZER] Entered "
+        "run_cp_sat_block_planning()",
+        flush=True,
+    )
+
     tasks = tasks or []
     windows = windows or []
-    train_occupancies = (
-        train_occupancies or []
-    )
+    train_occupancies = train_occupancies or []
     resources = resources or []
-    incompatible_pairs = (
-        incompatible_pairs or set()
-    )
-    corridor_capacities = (
-        corridor_capacities or {}
-    )
+    incompatible_pairs = incompatible_pairs or set()
+    corridor_capacities = corridor_capacities or {}
 
     # ========================================================================
     # STEP 0 — INPUT VALIDATION
     # ========================================================================
 
     if not tasks:
-
         return _empty_result(
             reason="NO_TASKS",
             tasks=[],
@@ -1119,7 +965,6 @@ def run_cp_sat_block_planning(
         )
 
     if not windows:
-
         return _empty_result(
             reason="NO_VALID_WINDOWS",
             tasks=tasks,
@@ -1130,11 +975,9 @@ def run_cp_sat_block_planning(
     # STEP 1 — OCCUPANCY LOOKUP
     # ========================================================================
 
-    occupancy_lookup = (
-        _build_occupancy_lookup(
-            train_occupancies=train_occupancies,
-            base_date=today,
-        )
+    occupancy_lookup = _build_occupancy_lookup(
+        train_occupancies=train_occupancies,
+        base_date=today,
     )
 
     # ========================================================================
@@ -1154,15 +997,11 @@ def run_cp_sat_block_planning(
                 continue
 
             start_local = _to_minutes(
-                window.get(
-                    "start_time"
-                )
+                window.get("start_time")
             )
 
             end_local = _to_minutes(
-                window.get(
-                    "end_time"
-                )
+                window.get("end_time")
             )
 
             start_local, end_local = (
@@ -1173,9 +1012,7 @@ def run_cp_sat_block_planning(
             )
 
             corridor_id = int(
-                window.get(
-                    "corridor_id"
-                )
+                window.get("corridor_id")
             )
 
         except (
@@ -1194,30 +1031,20 @@ def run_cp_sat_block_planning(
             )
         )
 
-        occupancy_ranges = (
-            occupancy_lookup.get(
-                corridor_id,
-                [],
-            )
+        occupancy_ranges = occupancy_lookup.get(
+            corridor_id,
+            [],
         )
 
-        free_intervals = (
-            _compute_free_intervals(
-                window_start=global_start,
-                window_end=global_end,
-                occupancy_ranges=(
-                    occupancy_ranges
-                ),
-            )
+        free_intervals = _compute_free_intervals(
+            window_start=global_start,
+            window_end=global_end,
+            occupancy_ranges=occupancy_ranges,
         )
 
         total_free_minutes = sum(
-            _duration(
-                start,
-                end,
-            )
-            for start, end
-            in free_intervals
+            _duration(start, end)
+            for start, end in free_intervals
         )
 
         window_meta.append(
@@ -1228,19 +1055,14 @@ def run_cp_sat_block_planning(
                 "global_start": global_start,
                 "global_end": global_end,
                 "free_intervals": free_intervals,
-                "total_free_minutes": (
-                    total_free_minutes
-                ),
-                "freight_penalty": (
-                    _freight_penalty(
-                        window
-                    )
+                "total_free_minutes": total_free_minutes,
+                "freight_penalty": _freight_penalty(
+                    window
                 ),
             }
         )
 
     if not window_meta:
-
         return _empty_result(
             reason="NO_VALID_WINDOWS",
             tasks=tasks,
@@ -1251,25 +1073,26 @@ def run_cp_sat_block_planning(
     # STEP 3 — RESOURCE AVAILABILITY
     # ========================================================================
 
-    resource_available: dict[
-        Any,
-        bool
-    ] = {}
+    resource_available: dict[Any, bool] = {}
 
     for resource in resources:
 
         if "id" not in resource:
             continue
 
+        resource_id = resource["id"]
+
         resource_available[
-            resource["id"]
+            resource_id
         ] = (
             str(
                 resource.get(
                     "availability_status",
                     "available",
                 )
-            ).lower().strip()
+            )
+            .lower()
+            .strip()
             == "available"
         )
 
@@ -1287,7 +1110,6 @@ def run_cp_sat_block_planning(
             continue
 
         try:
-
             if len(pair) != 2:
                 continue
 
@@ -1318,42 +1140,31 @@ def run_cp_sat_block_planning(
         )
 
     # ========================================================================
-    # STEP 5 — BUILD SMALL CANDIDATE SET
+    # STEP 5 — BUILD CANDIDATES
     # ========================================================================
 
     candidates: dict[
         tuple[int, int, int],
-        dict
+        dict,
     ] = {}
 
     infeasibility_reasons: dict[
         int,
-        set[str]
+        set[str],
     ] = defaultdict(set)
 
-    for task_index, task in enumerate(
-        tasks
-    ):
+    for task_index, task in enumerate(tasks):
+
+        duration = _safe_int(
+            task.get(
+                "estimated_duration_minutes",
+                0,
+            )
+        )
 
         # ---------------------------------------------------------------
         # Validate duration
         # ---------------------------------------------------------------
-
-        try:
-
-            duration = int(
-                task.get(
-                    "estimated_duration_minutes",
-                    0,
-                )
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
-            duration = 0
 
         if duration <= 0:
 
@@ -1383,61 +1194,39 @@ def run_cp_sat_block_planning(
             "required_resource_id"
         )
 
-        if (
-            resource_id is not None
-            and not resource_available.get(
-                resource_id,
-                False,
-            )
-        ):
+        if resource_id is not None:
 
-            infeasibility_reasons[
-                task_index
-            ].add(
-                "resource_unavailable"
-            )
+            # If resources are provided, the resource must exist
+            # and be available.
+            if (
+                resources
+                and not resource_available.get(
+                    resource_id,
+                    False,
+                )
+            ):
 
-            continue
+                infeasibility_reasons[
+                    task_index
+                ].add(
+                    "resource_unavailable"
+                )
+
+                continue
 
         # ---------------------------------------------------------------
-        # Match task to corridor
+        # Match task to corridor/window
         # ---------------------------------------------------------------
 
-        task_corridor_id = (
-            task.get(
-                "corridor_id"
-            )
+        task_corridor_id = task.get(
+            "corridor_id"
         )
 
-        if task_corridor_id is None:
+        matching_windows: list[
+            tuple[int, dict]
+        ] = []
 
-            # Try matching using corridor block ID.
-            task_block_id = str(
-                task.get(
-                    "corridor_block_id",
-                    "",
-                )
-            ).upper().strip()
-
-            matching_windows = [
-                (
-                    index,
-                    window
-                )
-                for index, window
-                in enumerate(
-                    window_meta
-                )
-                if str(
-                    window.get(
-                        "corridor_block_id",
-                        "",
-                    )
-                ).upper().strip()
-                == task_block_id
-            ]
-
-        else:
+        if task_corridor_id is not None:
 
             try:
                 task_corridor_id = int(
@@ -1449,22 +1238,46 @@ def run_cp_sat_block_planning(
             ):
                 task_corridor_id = None
 
+        if task_corridor_id is not None:
+
             matching_windows = [
                 (
                     index,
-                    window
+                    window,
                 )
                 for index, window
-                in enumerate(
-                    window_meta
-                )
-                if (
-                    window.get(
-                        "corridor_id"
-                    )
-                    == task_corridor_id
-                )
+                in enumerate(window_meta)
+                if window.get(
+                    "corridor_id"
+                ) == task_corridor_id
             ]
+
+        else:
+
+            task_block_id = str(
+                task.get(
+                    "corridor_block_id",
+                    "",
+                )
+            ).upper().strip()
+
+            if task_block_id:
+
+                matching_windows = [
+                    (
+                        index,
+                        window,
+                    )
+                    for index, window
+                    in enumerate(window_meta)
+                    if str(
+                        window.get(
+                            "corridor_block_id",
+                            "",
+                        )
+                    ).upper().strip()
+                    == task_block_id
+                ]
 
         if not matching_windows:
 
@@ -1477,24 +1290,18 @@ def run_cp_sat_block_planning(
             continue
 
         # ---------------------------------------------------------------
-        # Generate candidates
+        # Generate candidate starts
         # ---------------------------------------------------------------
 
-        for window_index, window in (
-            matching_windows
-        ):
+        for window_index, window in matching_windows:
 
-            free_intervals = (
-                window[
-                    "free_intervals"
-                ]
-            )
+            free_intervals = window[
+                "free_intervals"
+            ]
 
-            starts = (
-                _find_fitting_starts(
-                    free_intervals=free_intervals,
-                    duration_minutes=duration,
-                )
+            starts = _find_fitting_starts(
+                free_intervals=free_intervals,
+                duration_minutes=duration,
             )
 
             if not starts:
@@ -1509,17 +1316,12 @@ def run_cp_sat_block_planning(
 
             for start in starts:
 
-                end = (
-                    start
-                    + duration
-                )
+                end = start + duration
 
-                if end > window[
-                    "global_end"
-                ]:
+                if end > window["global_end"]:
                     continue
 
-                # Additional exact free-interval safety check.
+                # Exact free interval check
                 inside_free_interval = any(
                     start >= free_start
                     and end <= free_end
@@ -1557,105 +1359,54 @@ def run_cp_sat_block_planning(
             solve_start=solve_start,
         )
 
-        result[
-            "unscheduled"
-        ] = []
+        result["unscheduled"] = []
 
-        for task_index, task in enumerate(
-            tasks
-        ):
+        for task_index, task in enumerate(tasks):
 
-            reasons = (
-                infeasibility_reasons[
-                    task_index
-                ]
-            )
+            reasons = infeasibility_reasons[
+                task_index
+            ]
 
-            if (
-                "invalid_duration"
-                in reasons
-            ):
-                reason = (
-                    "invalid_duration"
-                )
+            if "invalid_duration" in reasons:
+                reason = "invalid_duration"
 
-            elif (
-                "duration_exceeds_one_day"
-                in reasons
-            ):
-                reason = (
-                    "duration_exceeds_one_day"
-                )
+            elif "duration_exceeds_one_day" in reasons:
+                reason = "duration_exceeds_one_day"
 
-            elif (
-                "resource_unavailable"
-                in reasons
-            ):
-                reason = (
-                    "resource_unavailable"
-                )
+            elif "resource_unavailable" in reasons:
+                reason = "resource_unavailable"
 
-            elif (
-                "no_matching_corridor"
-                in reasons
-            ):
-                reason = (
-                    "no_matching_corridor"
-                )
+            elif "no_matching_corridor" in reasons:
+                reason = "no_matching_corridor"
 
-            elif (
-                "insufficient_window_duration"
-                in reasons
-            ):
-                reason = (
-                    "insufficient_window_duration"
-                )
+            elif "insufficient_window_duration" in reasons:
+                reason = "insufficient_window_duration"
 
             else:
-                reason = (
-                    "no_feasible_time_window"
-                )
+                reason = "no_feasible_time_window"
 
-            result[
-                "unscheduled"
-            ].append(
+            result["unscheduled"].append(
                 {
-                    "task_id": task.get(
-                        "id"
+                    "task_id": task.get("id"),
+                    "task_ref": task.get("task_ref"),
+                    "department_code": task.get(
+                        "department_code"
                     ),
-                    "task_ref": task.get(
-                        "task_ref"
+                    "corridor_block_id": task.get(
+                        "corridor_block_id"
                     ),
-                    "department_code": (
-                        task.get(
-                            "department_code"
-                        )
+                    "defect_type": task.get(
+                        "defect_type"
                     ),
-                    "corridor_block_id": (
-                        task.get(
-                            "corridor_block_id"
-                        )
+                    "criticality": task.get(
+                        "criticality"
                     ),
-                    "defect_type": (
-                        task.get(
-                            "defect_type"
-                        )
+                    "due_date": _json_safe_date(
+                        task.get("due_date")
                     ),
-                    "criticality": (
-                        task.get(
-                            "criticality"
-                        )
-                    ),
-                    "due_date": (
-                        task.get(
-                            "due_date"
-                        )
-                    ),
-                    "priority_score": (
-                        task.get(
-                            "priority_score",
-                            0,
-                        )
+                    "priority_score": task.get(
+                        "priority_score",
+                        0,
                     ),
                     "reason": reason,
                 }
@@ -1672,7 +1423,7 @@ def run_cp_sat_block_planning(
         return result
 
     # ========================================================================
-    # STEP 6 — CP-SAT MODEL
+    # STEP 6 — CREATE CP-SAT MODEL
     # ========================================================================
 
     model = cp_model.CpModel()
@@ -1687,9 +1438,7 @@ def run_cp_sat_block_planning(
         cp_model.IntervalVar,
     ] = {}
 
-    for key, candidate in (
-        candidates.items()
-    ):
+    for key, candidate in candidates.items():
 
         task_index = candidate[
             "task_index"
@@ -1699,7 +1448,7 @@ def run_cp_sat_block_planning(
             "global_start"
         ]
 
-        duration = int(
+        duration = _safe_int(
             tasks[
                 task_index
             ].get(
@@ -1708,16 +1457,11 @@ def run_cp_sat_block_planning(
             )
         )
 
-        presence = (
-            model.new_bool_var(
-                (
-                    f"assign_t"
-                    f"{task_index}"
-                    f"_w"
-                    f"{candidate['window_index']}"
-                    f"_s"
-                    f"{start}"
-                )
+        presence = model.new_bool_var(
+            (
+                f"assign_t{task_index}"
+                f"_w{candidate['window_index']}"
+                f"_s{start}"
             )
         )
 
@@ -1729,12 +1473,9 @@ def run_cp_sat_block_planning(
                 duration,
                 presence,
                 (
-                    f"interval_t"
-                    f"{task_index}"
-                    f"_w"
-                    f"{candidate['window_index']}"
-                    f"_s"
-                    f"{start}"
+                    f"interval_t{task_index}"
+                    f"_w{candidate['window_index']}"
+                    f"_s{start}"
                 ),
             )
         )
@@ -1745,34 +1486,28 @@ def run_cp_sat_block_planning(
 
     candidates_by_task: dict[
         int,
-        list[cp_model.IntVar]
+        list[cp_model.IntVar],
     ] = defaultdict(list)
 
-    for key, variable in (
-        assign.items()
-    ):
+    for key, variable in assign.items():
 
         candidates_by_task[
             key[0]
-        ].append(
-            variable
-        )
+        ].append(variable)
 
-    for task_index, variables in (
-        candidates_by_task.items()
-    ):
+    for variables in candidates_by_task.values():
 
         model.add(
             sum(variables) <= 1
         )
 
     # ========================================================================
-    # CONSTRAINT 2 — RESOURCE AVAILABILITY / RESOURCE OVERLAP
+    # CONSTRAINT 2 — RESOURCE OVERLAP
     # ========================================================================
 
     resource_groups: dict[
         Any,
-        list[cp_model.IntervalVar]
+        list[cp_model.IntervalVar],
     ] = defaultdict(list)
 
     for key in candidates:
@@ -1794,14 +1529,11 @@ def run_cp_sat_block_planning(
             intervals[key]
         )
 
-    for resource_id, group in (
-        resource_groups.items()
-    ):
+    for resource_id, group in resource_groups.items():
 
         if not group:
             continue
 
-        # One physical resource can perform one task at a time.
         model.add_cumulative(
             group,
             [1] * len(group),
@@ -1810,12 +1542,6 @@ def run_cp_sat_block_planning(
 
     # ========================================================================
     # CONSTRAINT 3 — SAFETY INCOMPATIBILITY
-    # ========================================================================
-    #
-    # This is deliberately restricted to actual candidate overlaps.
-    #
-    # Because we only generate two candidates per free interval, this remains
-    # very small compared with the previous five-minute candidate approach.
     # ========================================================================
 
     candidate_items = list(
@@ -1826,15 +1552,11 @@ def run_cp_sat_block_planning(
         len(candidate_items)
     ):
 
-        key_a, var_a = (
-            candidate_items[
-                index_a
-            ]
-        )
-
-        candidate_a = candidates[
-            key_a
+        key_a, var_a = candidate_items[
+            index_a
         ]
+
+        candidate_a = candidates[key_a]
 
         task_a_index = candidate_a[
             "task_index"
@@ -1844,8 +1566,13 @@ def run_cp_sat_block_planning(
             task_a_index
         ]
 
-        corridor_a = task_a.get(
-            "corridor_id"
+        window_a = window_meta[
+            candidate_a["window_index"]
+        ]
+
+        corridor_a = _get_task_corridor_id(
+            task_a,
+            window_a,
         )
 
         defect_a = str(
@@ -1853,82 +1580,48 @@ def run_cp_sat_block_planning(
                 "defect_type",
                 "",
             )
-        ).upper()
-
-        # If task corridor_id is missing, use window corridor.
-        if corridor_a is None:
-
-            corridor_a = (
-                window_meta[
-                    candidate_a[
-                        "window_index"
-                    ]
-                ].get(
-                    "corridor_id"
-                )
-            )
+        ).upper().strip()
 
         for index_b in range(
             index_a + 1,
             len(candidate_items),
         ):
 
-            key_b, var_b = (
-                candidate_items[
-                    index_b
-                ]
-            )
-
-            candidate_b = candidates[
-                key_b
+            key_b, var_b = candidate_items[
+                index_b
             ]
+
+            candidate_b = candidates[key_b]
 
             task_b_index = candidate_b[
                 "task_index"
             ]
 
-            if (
-                task_a_index
-                == task_b_index
-            ):
+            # Same task is already limited by <= 1
+            if task_a_index == task_b_index:
                 continue
 
             task_b = tasks[
                 task_b_index
             ]
 
-            corridor_b = task_b.get(
-                "corridor_id"
+            window_b = window_meta[
+                candidate_b["window_index"]
+            ]
+
+            corridor_b = _get_task_corridor_id(
+                task_b,
+                window_b,
             )
-
-            if corridor_b is None:
-
-                corridor_b = (
-                    window_meta[
-                        candidate_b[
-                            "window_index"
-                        ]
-                    ].get(
-                        "corridor_id"
-                    )
-                )
 
             if corridor_a != corridor_b:
                 continue
 
             if not _overlaps(
-                candidate_a[
-                    "global_start"
-                ],
-                candidate_a[
-                    "global_end"
-                ],
-                candidate_b[
-                    "global_start"
-                ],
-                candidate_b[
-                    "global_end"
-                ],
+                candidate_a["global_start"],
+                candidate_a["global_end"],
+                candidate_b["global_start"],
+                candidate_b["global_end"],
             ):
                 continue
 
@@ -1937,7 +1630,7 @@ def run_cp_sat_block_planning(
                     "defect_type",
                     "",
                 )
-            ).upper()
+            ).upper().strip()
 
             defect_pair = frozenset(
                 (
@@ -1946,10 +1639,7 @@ def run_cp_sat_block_planning(
                 )
             )
 
-            if (
-                defect_pair
-                in normalized_incompatible
-            ):
+            if defect_pair in normalized_incompatible:
 
                 model.add(
                     var_a + var_b <= 1
@@ -1961,49 +1651,45 @@ def run_cp_sat_block_planning(
 
     corridor_groups: dict[
         int,
-        list[cp_model.IntervalVar]
+        list[cp_model.IntervalVar],
     ] = defaultdict(list)
 
     for key in candidates:
 
         task_index = key[0]
 
-        corridor_id = tasks[
+        task = tasks[
             task_index
-        ].get(
-            "corridor_id"
+        ]
+
+        window = window_meta[
+            key[1]
+        ]
+
+        corridor_id = _get_task_corridor_id(
+            task,
+            window,
         )
-
-        if corridor_id is None:
-
-            corridor_id = (
-                window_meta[
-                    key[1]
-                ].get(
-                    "corridor_id"
-                )
-            )
 
         if corridor_id is None:
             continue
 
         corridor_groups[
-            int(corridor_id)
+            corridor_id
         ].append(
             intervals[key]
         )
 
-    for corridor_id, group in (
-        corridor_groups.items()
-    ):
+    for corridor_id, group in corridor_groups.items():
 
         capacity = max(
             1,
-            int(
+            _safe_int(
                 corridor_capacities.get(
                     corridor_id,
                     1,
-                )
+                ),
+                1,
             ),
         )
 
@@ -2019,25 +1705,14 @@ def run_cp_sat_block_planning(
 
     objective_terms = []
 
-    for key, variable in (
-        assign.items()
-    ):
+    for key, variable in assign.items():
 
         task_index = key[0]
-
         window_index = key[1]
 
-        candidate = candidates[
-            key
-        ]
-
-        task = tasks[
-            task_index
-        ]
-
-        window = window_meta[
-            window_index
-        ]
+        candidate = candidates[key]
+        task = tasks[task_index]
+        window = window_meta[window_index]
 
         # ---------------------------------------------------------------
         # Priority
@@ -2113,20 +1788,18 @@ def run_cp_sat_block_planning(
         )
 
         # ---------------------------------------------------------------
-        # Freight penalty
+        # Freight impact
         # ---------------------------------------------------------------
 
-        freight_component = (
-            _freight_penalty(
-                window
-            )
+        freight_component = _freight_penalty(
+            window
         )
 
         # ---------------------------------------------------------------
         # Duration penalty
         # ---------------------------------------------------------------
 
-        duration = int(
+        duration = _safe_int(
             task.get(
                 "estimated_duration_minutes",
                 0,
@@ -2139,23 +1812,20 @@ def run_cp_sat_block_planning(
         )
 
         # ---------------------------------------------------------------
-        # Small preference for earlier work
+        # Late-day penalty
         # ---------------------------------------------------------------
 
-        local_hour = (
-            candidate[
-                "global_start"
-            ]
+        local_minute = (
+            candidate["global_start"]
             % MINUTES_PER_DAY
         )
 
         late_day_hours = max(
             0,
             (
-                local_hour
+                local_minute
                 - 18 * 60
-            )
-            / 60,
+            ) / 60,
         )
 
         late_day_penalty = int(
@@ -2176,23 +1846,11 @@ def run_cp_sat_block_planning(
         )
 
         objective_terms.append(
-            candidate_score
-            * variable
+            candidate_score * variable
         )
 
-    # We intentionally do not use a huge number of coordination variables.
-    #
-    # Coordination is represented later by physical block grouping.
-    #
-    # This is one of the main performance improvements over the older model.
-
-    # Small penalty for each selected task start.
-    #
-    # Since every task is scheduled at most once, this encourages efficient
-    # use of the available maintenance opportunities.
-    for key, variable in (
-        assign.items()
-    ):
+    # Small penalty per selected candidate.
+    for variable in assign.values():
 
         objective_terms.append(
             -1 * variable
@@ -2201,9 +1859,7 @@ def run_cp_sat_block_planning(
     if objective_terms:
 
         model.maximize(
-            sum(
-                objective_terms
-            )
+            sum(objective_terms)
         )
 
     # ========================================================================
@@ -2222,20 +1878,43 @@ def run_cp_sat_block_planning(
 
     solver.parameters.random_seed = 42
 
-    solver.parameters.log_search_progress = (
-        False
+    solver.parameters.log_search_progress = False
+
+    solver.parameters.cp_model_presolve = True
+
+    print(
+        f"[OPTIMIZER] Starting CP-SAT solve. "
+        f"candidates={len(candidates)}, "
+        f"tasks={len(tasks)}, "
+        f"windows={len(window_meta)}",
+        flush=True,
     )
 
-    # CP-SAT should return as soon as the configured limit is reached.
-    solver.parameters.cp_model_presolve = True
+    # ------------------------------------------------------------------------
+    # IMPORTANT:
+    #
+    # The return belongs INSIDE except.
+    #
+    # If solve() succeeds, execution must continue to STEP 9.
+    # ------------------------------------------------------------------------
 
     try:
 
-        status = solver.solve(
-            model
+        status = solver.solve(model)
+
+        print(
+            f"[OPTIMIZER] CP-SAT returned. "
+            f"status={solver.status_name(status)}",
+            flush=True,
         )
 
     except Exception as exc:
+
+        print(
+            f"[OPTIMIZER] CP-SAT ERROR: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
 
         return _empty_result(
             reason=(
@@ -2255,8 +1934,20 @@ def run_cp_sat_block_planning(
         status
     )
 
+    print(
+        f"[OPTIMIZER] Solve time: {round(solve_ms, 2)} ms",
+        flush=True,
+    )
+
+    print(
+        f"[OPTIMIZER] candidates={len(candidates)}, "
+        f"tasks={len(tasks)}, "
+        f"solver_status={status_name}",
+        flush=True,
+    )
+
     # ========================================================================
-    # SOLVER STATUS
+    # STEP 8A — INVALID MODEL
     # ========================================================================
 
     if status == cp_model.MODEL_INVALID:
@@ -2266,10 +1957,10 @@ def run_cp_sat_block_planning(
             "This indicates a bug in constraint construction."
         )
 
-    # IMPORTANT:
-    #
-    # If CP-SAT cannot find a feasible solution within the time limit,
-    # return cleanly instead of leaving the API request hanging.
+    # ========================================================================
+    # STEP 8B — NO FEASIBLE SOLUTION
+    # ========================================================================
+
     if status not in (
         cp_model.OPTIMAL,
         cp_model.FEASIBLE,
@@ -2277,15 +1968,11 @@ def run_cp_sat_block_planning(
 
         if status == cp_model.INFEASIBLE:
 
-            reason = (
-                "solver_infeasible"
-            )
+            reason = "solver_infeasible"
 
         elif status == cp_model.UNKNOWN:
 
-            reason = (
-                "solver_timeout"
-            )
+            reason = "solver_unknown"
 
         else:
 
@@ -2294,46 +1981,38 @@ def run_cp_sat_block_planning(
                 + status_name.lower()
             )
 
+        print(
+            f"[OPTIMIZER] Done. scheduled=0, "
+            f"unscheduled={len(tasks)}, "
+            f"candidates={len(candidates)}, "
+            f"reason={reason}",
+            flush=True,
+        )
+
         return {
             "scheduled": [],
             "unscheduled": [
                 {
-                    "task_id": task.get(
-                        "id"
+                    "task_id": task.get("id"),
+                    "task_ref": task.get("task_ref"),
+                    "department_code": task.get(
+                        "department_code"
                     ),
-                    "task_ref": task.get(
-                        "task_ref"
+                    "corridor_block_id": task.get(
+                        "corridor_block_id"
                     ),
-                    "department_code": (
-                        task.get(
-                            "department_code"
-                        )
+                    "defect_type": task.get(
+                        "defect_type"
                     ),
-                    "corridor_block_id": (
-                        task.get(
-                            "corridor_block_id"
-                        )
+                    "criticality": task.get(
+                        "criticality"
                     ),
-                    "defect_type": (
-                        task.get(
-                            "defect_type"
-                        )
+                    "due_date": _json_safe_date(
+                        task.get("due_date")
                     ),
-                    "criticality": (
-                        task.get(
-                            "criticality"
-                        )
-                    ),
-                    "due_date": (
-                        task.get(
-                            "due_date"
-                        )
-                    ),
-                    "priority_score": (
-                        task.get(
-                            "priority_score",
-                            0,
-                        )
+                    "priority_score": task.get(
+                        "priority_score",
+                        0,
                     ),
                     "reason": reason,
                 }
@@ -2344,9 +2023,7 @@ def run_cp_sat_block_planning(
                 "solver_optimal": False,
                 "solver_feasible": False,
                 "total_scheduled": 0,
-                "total_unscheduled": len(
-                    tasks
-                ),
+                "total_unscheduled": len(tasks),
                 "total_blocks": 0,
                 "total_block_minutes": 0,
                 "asset_availability_score": 100.0,
@@ -2374,7 +2051,7 @@ def run_cp_sat_block_planning(
 
     task_scheduled: dict[
         int,
-        bool
+        bool,
     ] = {
         index: False
         for index in range(
@@ -2382,13 +2059,9 @@ def run_cp_sat_block_planning(
         )
     }
 
-    for key, variable in (
-        assign.items()
-    ):
+    for key, variable in assign.items():
 
-        if solver.boolean_value(
-            variable
-        ):
+        if solver.boolean_value(variable):
 
             selected_candidates.append(
                 key
@@ -2404,14 +2077,14 @@ def run_cp_sat_block_planning(
 
     uf_parent: dict[
         tuple[int, int, int],
-        tuple[int, int, int]
+        tuple[int, int, int],
     ] = {
         key: key
         for key in selected_candidates
     }
 
     def uf_find(
-        value: tuple[int, int, int]
+        value: tuple[int, int, int],
     ) -> tuple[int, int, int]:
 
         current = value
@@ -2438,13 +2111,8 @@ def run_cp_sat_block_planning(
         second: tuple[int, int, int],
     ) -> None:
 
-        root_first = uf_find(
-            first
-        )
-
-        root_second = uf_find(
-            second
-        )
+        root_first = uf_find(first)
+        root_second = uf_find(second)
 
         if root_first != root_second:
 
@@ -2452,99 +2120,69 @@ def run_cp_sat_block_planning(
                 root_first
             ] = root_second
 
-    # ---------------------------------------------------------------
-    # Connect overlapping tasks on same corridor.
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Connect overlapping tasks on same corridor
+    # ------------------------------------------------------------------------
 
     for index_a in range(
         len(selected_candidates)
     ):
 
-        candidate_a = (
-            selected_candidates[
-                index_a
-            ]
-        )
+        candidate_a = selected_candidates[
+            index_a
+        ]
 
         data_a = candidates[
             candidate_a
         ]
 
         task_a = tasks[
-            data_a[
-                "task_index"
-            ]
+            data_a["task_index"]
         ]
 
-        corridor_a = task_a.get(
-            "corridor_id"
+        window_a = window_meta[
+            data_a["window_index"]
+        ]
+
+        corridor_a = _get_task_corridor_id(
+            task_a,
+            window_a,
         )
-
-        if corridor_a is None:
-
-            corridor_a = (
-                window_meta[
-                    data_a[
-                        "window_index"
-                    ]
-                ].get(
-                    "corridor_id"
-                )
-            )
 
         for index_b in range(
             index_a + 1,
             len(selected_candidates),
         ):
 
-            candidate_b = (
-                selected_candidates[
-                    index_b
-                ]
-            )
+            candidate_b = selected_candidates[
+                index_b
+            ]
 
             data_b = candidates[
                 candidate_b
             ]
 
             task_b = tasks[
-                data_b[
-                    "task_index"
-                ]
+                data_b["task_index"]
             ]
 
-            corridor_b = task_b.get(
-                "corridor_id"
+            window_b = window_meta[
+                data_b["window_index"]
+            ]
+
+            corridor_b = _get_task_corridor_id(
+                task_b,
+                window_b,
             )
-
-            if corridor_b is None:
-
-                corridor_b = (
-                    window_meta[
-                        data_b[
-                            "window_index"
-                        ]
-                    ].get(
-                        "corridor_id"
-                    )
-                )
 
             if corridor_a != corridor_b:
                 continue
 
             if _overlaps(
-                data_a[
-                    "global_start"
-                ],
-                data_a[
-                    "global_end"
-                ],
-                data_b[
-                    "global_start"
-                ],
-                data_b[
-                    "global_end"
-                ],
+                data_a["global_start"],
+                data_a["global_end"],
+                data_b["global_start"],
+                data_b["global_end"],
             ):
 
                 uf_union(
@@ -2554,26 +2192,22 @@ def run_cp_sat_block_planning(
 
     block_groups: dict[
         tuple[int, int, int],
-        list[
-            tuple[int, int, int]
-        ]
+        list[tuple[int, int, int]],
     ] = defaultdict(list)
 
     for candidate in selected_candidates:
 
         block_groups[
             uf_find(candidate)
-        ].append(
-            candidate
-        )
+        ].append(candidate)
 
     # ========================================================================
-    # STEP 11 — CREATE BLOCK GROUP IDs
+    # STEP 11 — CREATE BLOCK GROUP IDS
     # ========================================================================
 
     block_group_lookup: dict[
         tuple[int, int, int],
-        str
+        str,
     ] = {}
 
     total_block_minutes = 0
@@ -2589,32 +2223,25 @@ def run_cp_sat_block_planning(
             continue
 
         group_start = min(
-            candidates[
-                candidate
-            ][
+            candidates[candidate][
                 "global_start"
             ]
             for candidate in group
         )
 
         group_end = max(
-            candidates[
-                candidate
-            ][
+            candidates[candidate][
                 "global_end"
             ]
             for candidate in group
         )
 
         total_block_minutes += (
-            group_end
-            - group_start
+            group_end - group_start
         )
 
         departments = {
-            tasks[
-                candidate[0]
-            ].get(
+            tasks[candidate[0]].get(
                 "department_id"
             )
             for candidate in group
@@ -2626,18 +2253,12 @@ def run_cp_sat_block_planning(
 
             shared_blocks += 1
 
-            coordinated_tasks += (
-                len(group)
-            )
+            coordinated_tasks += len(group)
 
-        first_candidate = group[
-            0
-        ]
+        first_candidate = group[0]
 
         first_window = window_meta[
-            candidates[
-                first_candidate
-            ][
+            candidates[first_candidate][
                 "window_index"
             ]
         ]
@@ -2645,7 +2266,7 @@ def run_cp_sat_block_planning(
         block_group_id = (
             f"BG"
             f"{str(horizon_str)[0].upper()}"
-            f"-{first_window['id']}"
+            f"-{first_window.get('id')}"
             f"-{group_start}"
             f"-{group_number}"
         )
@@ -2664,61 +2285,41 @@ def run_cp_sat_block_planning(
 
     for candidate in selected_candidates:
 
-        task_index = candidate[
-            0
-        ]
+        task_index = candidate[0]
+        window_index = candidate[1]
+        start = candidate[2]
 
-        window_index = candidate[
-            1
-        ]
+        task = tasks[task_index]
+        window = window_meta[window_index]
 
-        start = candidate[
-            2
-        ]
-
-        task = tasks[
-            task_index
-        ]
-
-        window = window_meta[
-            window_index
-        ]
-
-        duration = int(
+        duration = _safe_int(
             task.get(
                 "estimated_duration_minutes",
                 0,
             )
         )
 
-        end = (
-            start
-            + duration
-        )
+        end = start + duration
 
-        scheduled_date = (
-            window[
-                "date"
-            ]
+        scheduled_date = window["date"]
+
+        # Use task corridor first, then window corridor.
+        corridor_id = _get_task_corridor_id(
+            task,
+            window,
         )
 
         scheduled.append(
             {
-                "task_id": task.get(
-                    "id"
-                ),
-                "task_ref": task.get(
-                    "task_ref"
-                ),
+                "task_id": task.get("id"),
+                "task_ref": task.get("task_ref"),
                 "department_id": task.get(
                     "department_id"
                 ),
                 "department_code": task.get(
                     "department_code"
                 ),
-                "corridor_id": task.get(
-                    "corridor_id"
-                ),
+                "corridor_id": corridor_id,
                 "corridor_block_id": task.get(
                     "corridor_block_id"
                 ),
@@ -2728,48 +2329,35 @@ def run_cp_sat_block_planning(
                 "window_id": window.get(
                     "id"
                 ),
-                "block_group_id": (
-                    block_group_lookup[
-                        candidate
-                    ]
-                ),
-                "scheduled_date": (
+                "block_group_id": block_group_lookup[
+                    candidate
+                ],
+                "scheduled_date": _json_safe_date(
                     scheduled_date
                 ),
-                "entry_time": (
-                    _from_minutes(
-                        start
-                    )
+                "entry_time": _from_minutes(
+                    start
                 ),
-                "exit_time": (
-                    _from_minutes(
-                        end
-                    )
+                "exit_time": _from_minutes(
+                    end
                 ),
-                "priority_score": (
-                    task.get(
-                        "priority_score",
-                        0,
-                    )
+                "priority_score": task.get(
+                    "priority_score",
+                    0,
                 ),
-                "criticality": (
-                    task.get(
-                        "criticality"
-                    )
+                "criticality": task.get(
+                    "criticality"
                 ),
-                "asset_impact_score": (
-                    task.get(
-                        "asset_impact_score",
-                        0,
-                    )
+                "asset_impact_score": task.get(
+                    "asset_impact_score",
+                    0,
                 ),
                 "resource_id": task.get(
                     "required_resource_id"
                 ),
                 "status": (
                     "OPTIMAL"
-                    if status
-                    == cp_model.OPTIMAL
+                    if status == cp_model.OPTIMAL
                     else "FEASIBLE"
                 ),
             }
@@ -2781,129 +2369,73 @@ def run_cp_sat_block_planning(
 
     unscheduled: list[dict] = []
 
-    for task_index, task in enumerate(
-        tasks
-    ):
+    for task_index, task in enumerate(tasks):
 
-        if task_scheduled[
-            task_index
-        ]:
+        if task_scheduled[task_index]:
             continue
 
-        reason = (
-            _diagnose_unscheduled_reason(
-                task_index=task_index,
-                task=task,
-                tasks=tasks,
-                window_meta=window_meta,
-                candidates=candidates,
-                selected_candidates=(
-                    selected_candidates
-                ),
-                normalized_incompatible=(
-                    normalized_incompatible
-                ),
-                resource_available=(
-                    resource_available
-                ),
-                corridor_capacities=(
-                    corridor_capacities
-                ),
-                today=today,
-            )
+        reason = _diagnose_unscheduled_reason(
+            task_index=task_index,
+            task=task,
+            tasks=tasks,
+            window_meta=window_meta,
+            candidates=candidates,
+            selected_candidates=selected_candidates,
+            normalized_incompatible=(
+                normalized_incompatible
+            ),
+            resource_available=resource_available,
+            corridor_capacities=corridor_capacities,
+            today=today,
         )
 
         # Prefer direct preprocessing reasons.
-        reasons = (
-            infeasibility_reasons[
-                task_index
-            ]
-        )
+        reasons = infeasibility_reasons[
+            task_index
+        ]
 
-        if (
-            "invalid_duration"
-            in reasons
-        ):
-            reason = (
-                "invalid_duration"
-            )
+        if "invalid_duration" in reasons:
 
-        elif (
-            "duration_exceeds_one_day"
-            in reasons
-        ):
-            reason = (
-                "duration_exceeds_one_day"
-            )
+            reason = "invalid_duration"
 
-        elif (
-            "resource_unavailable"
-            in reasons
-        ):
-            reason = (
-                "resource_unavailable"
-            )
+        elif "duration_exceeds_one_day" in reasons:
 
-        elif (
-            "no_matching_corridor"
-            in reasons
-        ):
-            reason = (
-                "no_matching_corridor"
-            )
+            reason = "duration_exceeds_one_day"
 
-        elif (
-            "no_matching_corridor"
-            not in reasons
-            and not any(
-                key[0]
-                == task_index
-                for key in candidates
-            )
-            and not reason
-        ):
-            reason = (
-                "no_feasible_time_window"
-            )
+        elif "resource_unavailable" in reasons:
+
+            reason = "resource_unavailable"
+
+        elif "no_matching_corridor" in reasons:
+
+            reason = "no_matching_corridor"
+
+        elif "insufficient_window_duration" in reasons:
+
+            reason = "insufficient_window_duration"
 
         unscheduled.append(
             {
-                "task_id": task.get(
-                    "id"
+                "task_id": task.get("id"),
+                "task_ref": task.get("task_ref"),
+                "department_code": task.get(
+                    "department_code"
                 ),
-                "task_ref": task.get(
-                    "task_ref"
+                "corridor_block_id": task.get(
+                    "corridor_block_id"
                 ),
-                "department_code": (
-                    task.get(
-                        "department_code"
-                    )
+                "defect_type": task.get(
+                    "defect_type"
                 ),
-                "corridor_block_id": (
-                    task.get(
-                        "corridor_block_id"
-                    )
+                "criticality": task.get(
+                    "criticality"
                 ),
-                "defect_type": (
-                    task.get(
-                        "defect_type"
-                    )
+                "due_date": _json_safe_date(
+                    task.get("due_date")
                 ),
-                "criticality": (
-                    task.get(
-                        "criticality"
-                    )
-                ),
-                "due_date": (
-                    task.get(
-                        "due_date"
-                    )
-                ),
-                "priority_score": (
-                    task.get(
-                        "priority_score",
-                        0,
-                    )
+                "priority_score": task.get(
+                    "priority_score",
+                    0,
                 ),
                 "reason": reason,
             }
@@ -2914,9 +2446,7 @@ def run_cp_sat_block_planning(
     # ========================================================================
 
     total_window_minutes = sum(
-        window[
-            "total_free_minutes"
-        ]
+        window["total_free_minutes"]
         for window in window_meta
     )
 
@@ -2932,10 +2462,8 @@ def run_cp_sat_block_planning(
                 0.0,
                 min(
                     100.0,
-                    100.0
-                    * (
-                        1.0
-                        - utilization
+                    100.0 * (
+                        1.0 - utilization
                     ),
                 ),
             ),
@@ -2946,9 +2474,7 @@ def run_cp_sat_block_planning(
 
         asset_availability_score = 100.0
 
-    total_blocks = len(
-        block_groups
-    )
+    total_blocks = len(block_groups)
 
     average_scheduled_priority = (
         round(
@@ -2971,22 +2497,24 @@ def run_cp_sat_block_planning(
     overdue_tasks_scheduled = sum(
         1
         for candidate in selected_candidates
-        if (
-            _overdue_days(
-                tasks[
-                    candidate[0]
-                ].get(
-                    "due_date"
-                ),
-                today,
-            )
-            > 0
-        )
+        if _overdue_days(
+            tasks[candidate[0]].get(
+                "due_date"
+            ),
+            today,
+        ) > 0
     )
 
     # ========================================================================
     # FINAL RESULT
     # ========================================================================
+
+    print(
+        f"[OPTIMIZER] Done. scheduled={len(scheduled)}, "
+        f"unscheduled={len(unscheduled)}, "
+        f"candidates={len(candidates)}",
+        flush=True,
+    )
 
     return {
         "scheduled": scheduled,
@@ -2997,13 +2525,11 @@ def run_cp_sat_block_planning(
             "solver_status": status_name,
 
             "solver_optimal": (
-                status
-                == cp_model.OPTIMAL
+                status == cp_model.OPTIMAL
             ),
 
             "solver_feasible": (
-                status
-                in (
+                status in (
                     cp_model.OPTIMAL,
                     cp_model.FEASIBLE,
                 )
@@ -3017,9 +2543,7 @@ def run_cp_sat_block_planning(
                 unscheduled
             ),
 
-            "total_blocks": (
-                total_blocks
-            ),
+            "total_blocks": total_blocks,
 
             "total_block_minutes": (
                 total_block_minutes
