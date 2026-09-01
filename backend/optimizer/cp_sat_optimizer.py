@@ -1868,6 +1868,22 @@ def run_cp_sat_block_planning(
 
     solver = cp_model.CpSolver()
 
+    # Safety limit for hackathon/demo
+    solver.parameters.max_time_in_seconds = 10.0
+
+    # Use multiple CPU workers
+    solver.parameters.num_search_workers = 8
+
+    print("[OPTIMIZER] About to call solver.Solve()")
+    
+
+    status = solver.Solve(model)
+
+    print(f"[OPTIMIZER] solver.Solve() returned")
+    print(f"[OPTIMIZER] status = {solver.StatusName(status)}")
+    print(f"[OPTIMIZER] objective = {solver.ObjectiveValue()}")
+    print(f"[OPTIMIZER] best_bound = {solver.BestObjectiveBound()}")
+
     solver.parameters.max_time_in_seconds = (
         SOLVER_TIME_LIMIT_SECONDS
     )
@@ -1900,7 +1916,13 @@ def run_cp_sat_block_planning(
 
     try:
 
-        status = solver.solve(model)
+        print("[OPTIMIZER] About to call solver.Solve()")
+
+        status = solver.Solve(model)
+
+        print(f"[OPTIMIZER] solver.Solve() returned. status={status}")
+        print(f"[OPTIMIZER] Objective value={solver.ObjectiveValue()}")
+        print(f"[OPTIMIZER] Best bound={solver.BestObjectiveBound()}")
 
         print(
             f"[OPTIMIZER] CP-SAT returned. "
